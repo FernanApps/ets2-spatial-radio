@@ -26,6 +26,9 @@
 #define PATH_MAX 1024
 #endif
 
+/* Contrato de memoria compartida para audio externo (Chrome, Spotify, etc.) */
+#include "cabin_bridge.h"
+
 /*
  * ETS2 Cabin Radio — 3D Multi-Speaker Truck/Car Cabin Audio Processor
  * (macOS x86_64 & Windows x64)
@@ -51,13 +54,69 @@ typedef struct FMOD_STUDIO_BUS FMOD_STUDIO_BUS;
 typedef struct FMOD_SYSTEM FMOD_SYSTEM;
 typedef struct FMOD_CHANNELGROUP FMOD_CHANNELGROUP;
 typedef struct FMOD_DSP FMOD_DSP;
+typedef struct FMOD_SOUND FMOD_SOUND;
+typedef struct FMOD_CHANNEL FMOD_CHANNEL;
 
 enum {
     FMOD_OK = 0,
     FMOD_DSP_TYPE_COMPRESSOR = 16,
     FMOD_DSP_TYPE_THREE_EQ = 25,
-    FMOD_CHANNELCONTROL_DSP_TAIL = -3
+    FMOD_CHANNELCONTROL_DSP_TAIL = -3,
+    /* Flags para CreateSound/CreateStream */
+    FMOD_DEFAULT = 0x00000000,
+    FMOD_LOOP_NORMAL = 0x00000002,
+    FMOD_CREATESTREAM = 0x00000080,
+    FMOD_OPENUSER = 0x00000100,
+    FMOD_SOUND_FORMAT_PCMFLOAT = 5
 };
+
+/*
+ * FMOD_CREATESOUNDEXINFO para FMOD 2.03.x 64-bit.
+ * cbsize = 112 bytes (0x70). Verificado con Ghidra.
+ */
+typedef FMOD_RESULT (*FMOD_SOUND_PCMREAD_CALLBACK)(
+    FMOD_SOUND *sound, void *data, unsigned int datalen);
+typedef FMOD_RESULT (*FMOD_SOUND_PCMSETPOS_CALLBACK)(
+    FMOD_SOUND *sound, int subsound, unsigned int position, unsigned int postype);
+
+typedef struct {
+    int                           cbsize;
+    unsigned int                  length;
+    unsigned int                  fileoffset;
+    int                           numchannels;
+    int                           defaultfrequency;
+    int                           format;           /* FMOD_SOUND_FORMAT */
+    unsigned int                  decodebuffersize;
+    int                           initialsubsound;
+    int                           numsubsounds;
+    int                          *inclusionlist;
+    int                           inclusionlistnum;
+    FMOD_SOUND_PCMREAD_CALLBACK   pcmreadcallback;
+    FMOD_SOUND_PCMSETPOS_CALLBACK pcmsetposcallback;
+    void                         *nonblockcallback;
+    const char                   *dlsname;
+    const char                   *encryptionkey;
+    int                           maxpolyphony;
+    void                         *userdata;
+    int                           suggestedsoundtype;
+    void                         *fileuseropen;
+    void                         *fileuserclose;
+    void                         *fileuserread;
+    void                         *fileuserseek;
+    void                         *fileuserasyncread;
+    void                         *fileuserasynccancel;
+    void                         *fileuserdata;
+    int                           filebuffersize;
+    int                           channelorder;
+    void                         *initialsoundgroup;
+    unsigned int                  initialseekposition;
+    int                           initialseekpostype;
+    int                           ignoresetfilesystem;
+    unsigned int                  audioqueuepolicy;
+    unsigned int                  minmidigranularity;
+    int                           nonblockthreadid;
+    void                         *fsbguid;
+} FMOD_CREATESOUNDEXINFO;
 
 enum {
     EQ_LOWGAIN = 0,
@@ -131,6 +190,18 @@ typedef FMOD_RESULT (*SetIntFn)(FMOD_DSP *, int, int);
 typedef FMOD_RESULT (*ReleaseDSPFn)(FMOD_DSP *);
 typedef FMOD_RESULT (*GetVersionFn)(FMOD_SYSTEM *, unsigned int *, unsigned int *);
 
+/* Funciones para reproducir audio externo (bridge) */
+typedef FMOD_RESULT (*CreateSoundFn)(FMOD_SYSTEM *, const char *, unsigned int,
+                                      FMOD_CREATESOUNDEXINFO *, FMOD_SOUND **);
+typedef FMOD_RESULT (*PlaySoundFn)(FMOD_SYSTEM *, FMOD_SOUND *, FMOD_CHANNELGROUP *,
+                                    int, FMOD_CHANNEL **);
+typedef FMOD_RESULT (*SoundReleaseFn)(FMOD_SOUND *);
+typedef FMOD_RESULT (*ChannelStopFn)(FMOD_CHANNEL *);
+typedef FMOD_RESULT (*ChannelSetVolumeFn)(FMOD_CHANNEL *, float);
+typedef FMOD_RESULT (*ChannelIsPlayingFn)(FMOD_CHANNEL *, int *);
+typedef FMOD_RESULT (*SoundSetUserDataFn)(FMOD_SOUND *, void *);
+typedef FMOD_RESULT (*SoundGetUserDataFn)(FMOD_SOUND *, void **);
+
 typedef struct {
     StudioGetBusFn get_bus;
     StudioGetCoreFn get_core;
@@ -145,6 +216,15 @@ typedef struct {
     SetIntFn set_int;
     ReleaseDSPFn release_dsp;
     GetVersionFn get_version;
+    /* Para audio externo (bridge) */
+    CreateSoundFn create_sound;
+    PlaySoundFn play_sound;
+    SoundReleaseFn sound_release;
+    ChannelStopFn channel_stop;
+    ChannelSetVolumeFn channel_set_volume;
+    ChannelIsPlayingFn channel_is_playing;
+    SoundSetUserDataFn sound_set_userdata;
+    SoundGetUserDataFn sound_get_userdata;
 } CabinAPI;
 
 typedef struct {
@@ -238,6 +318,19 @@ static float g_last_wnd_r = 999.0f;
 static unsigned int g_retry_counter = 0;
 static CabinAPI g_api;
 static FILE *g_log = NULL;
+
+/* Estado del bridge de audio externo */
+#ifdef _WIN32
+static HANDLE g_bridge_handle = NULL;
+static CabinBridgeBlock *g_bridge = NULL;
+static FMOD_SOUND *g_bridge_sound = NULL;
+static FMOD_CHANNEL *g_bridge_channel = NULL;
+static FMOD_CHANNELGROUP *g_radio_group = NULL;
+static bool g_bridge_enabled = false;
+static int64_t g_bridge_read_pos = 0;
+static uint32_t g_bridge_underruns = 0;
+static unsigned int g_bridge_retry = 0;
+#endif
 
 #ifdef __APPLE__
 extern FMOD_RESULT FMOD_Studio_System_Update(FMOD_STUDIO_SYSTEM *system);
@@ -351,6 +444,16 @@ static bool resolve_symbols(void) {
     g_api.set_int = (SetIntFn)load_symbol("FMOD_DSP_SetParameterInt");
     g_api.release_dsp = (ReleaseDSPFn)load_symbol("FMOD_DSP_Release");
     g_api.get_version = (GetVersionFn)load_symbol("FMOD_System_GetVersion");
+
+    /* Símbolos para audio externo (opcionales: si faltan, solo se desactiva el bridge) */
+    g_api.create_sound = (CreateSoundFn)load_symbol("FMOD_System_CreateSound");
+    g_api.play_sound = (PlaySoundFn)load_symbol("FMOD_System_PlaySound");
+    g_api.sound_release = (SoundReleaseFn)load_symbol("FMOD_Sound_Release");
+    g_api.channel_stop = (ChannelStopFn)load_symbol("FMOD_Channel_Stop");
+    g_api.channel_set_volume = (ChannelSetVolumeFn)load_symbol("FMOD_Channel_SetVolume");
+    g_api.channel_is_playing = (ChannelIsPlayingFn)load_symbol("FMOD_Channel_IsPlaying");
+    g_api.sound_set_userdata = (SoundSetUserDataFn)load_symbol("FMOD_Sound_SetUserData");
+    g_api.sound_get_userdata = (SoundGetUserDataFn)load_symbol("FMOD_Sound_GetUserData");
 
     g_symbols_resolved = g_api.get_bus && g_api.get_core && g_api.flush &&
         g_api.lock_bus && g_api.get_group && g_api.create_dsp_by_type &&
@@ -793,6 +896,201 @@ static void compute_spatial_targets(float rot_rad, float cabin_out, float wnd_le
     g_targets = next;
 }
 
+/* ========================================================================
+ * AUDIO BRIDGE: reproduce audio externo (Chrome, Spotify, etc.) en bus:/radio
+ * ======================================================================== */
+#ifdef _WIN32
+
+static void bridge_close(void) {
+    if (g_bridge_channel && g_api.channel_stop) {
+        g_api.channel_stop(g_bridge_channel);
+    }
+    g_bridge_channel = NULL;
+
+    if (g_bridge_sound && g_api.sound_release) {
+        g_api.sound_release(g_bridge_sound);
+    }
+    g_bridge_sound = NULL;
+
+    if (g_bridge) {
+        UnmapViewOfFile(g_bridge);
+        g_bridge = NULL;
+    }
+    if (g_bridge_handle) {
+        CloseHandle(g_bridge_handle);
+        g_bridge_handle = NULL;
+    }
+    g_bridge_enabled = false;
+    g_bridge_read_pos = 0;
+}
+
+static bool bridge_open(void) {
+    if (g_bridge) return true;
+
+    g_bridge_handle = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
+                                        CABIN_BRIDGE_NAME);
+    if (!g_bridge_handle) return false;
+
+    g_bridge = (CabinBridgeBlock *)MapViewOfFile(
+        g_bridge_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, CABIN_BRIDGE_SIZE);
+    if (!g_bridge) {
+        CloseHandle(g_bridge_handle);
+        g_bridge_handle = NULL;
+        return false;
+    }
+
+    if (!cabin_bridge_valid(g_bridge)) {
+        cabin_log("Bridge: invalid magic/version/channels, ignoring.");
+        UnmapViewOfFile(g_bridge);
+        g_bridge = NULL;
+        CloseHandle(g_bridge_handle);
+        g_bridge_handle = NULL;
+        return false;
+    }
+
+    g_bridge_read_pos = g_bridge->write_pos;  /* empezar desde el final, sin latencia acumulada */
+    cabin_log("Bridge: connected to external audio source (pid %u).", g_bridge->source_pid);
+    return true;
+}
+
+/*
+ * Callback de FMOD: lee muestras del ring buffer.
+ * Corre en el hilo del mixer, sin locks, sin logs, sin malloc.
+ */
+static FMOD_RESULT bridge_pcm_read(FMOD_SOUND *sound, void *data,
+                                    unsigned int datalen) {
+    (void)sound;
+    float *out = (float *)data;
+    const unsigned int frames = datalen / (2 * sizeof(float));
+
+    if (!g_bridge || !g_bridge->enabled || !g_bridge->capturing) {
+        /* Silencio */
+        for (unsigned int i = 0; i < frames * 2; ++i) out[i] = 0.0f;
+        return FMOD_OK;
+    }
+
+    int64_t avail = cabin_bridge_available(g_bridge);
+    if (avail <= 0) {
+        /* Underrun: no hay datos */
+        for (unsigned int i = 0; i < frames * 2; ++i) out[i] = 0.0f;
+        g_bridge_underruns++;
+        return FMOD_OK;
+    }
+
+    /* Control de deriva: si hay demasiado buffer, descartamos hasta el objetivo */
+    if (avail > (int64_t)(CABIN_BRIDGE_TARGET_LATENCY * 2)) {
+        int64_t skip = avail - CABIN_BRIDGE_TARGET_LATENCY;
+        g_bridge_read_pos += skip;
+        avail = CABIN_BRIDGE_TARGET_LATENCY;
+    }
+
+    const float gain = g_bridge->gain;
+    unsigned int copied = 0;
+    while (copied < frames && avail > 0) {
+        uint32_t idx = cabin_bridge_index(g_bridge_read_pos);
+        out[copied * 2 + 0] = g_bridge->data[idx + 0] * gain;
+        out[copied * 2 + 1] = g_bridge->data[idx + 1] * gain;
+        g_bridge_read_pos++;
+        avail--;
+        copied++;
+    }
+
+    /* Rellenar el resto con silencio si no hubo suficiente */
+    for (unsigned int i = copied; i < frames; ++i) {
+        out[i * 2 + 0] = 0.0f;
+        out[i * 2 + 1] = 0.0f;
+    }
+
+    /* Publicar read_pos para que el productor sepa cuánto consumimos */
+    MemoryBarrier();
+    g_bridge->read_pos = g_bridge_read_pos;
+
+    return FMOD_OK;
+}
+
+static bool bridge_try_start(FMOD_SYSTEM *core) {
+    if (!g_api.create_sound || !g_api.play_sound || !g_radio_group) {
+        return false;
+    }
+
+    if (g_bridge_sound) return true;  /* ya creado */
+
+    FMOD_CREATESOUNDEXINFO exinfo;
+    memset(&exinfo, 0, sizeof(exinfo));
+    exinfo.cbsize            = sizeof(FMOD_CREATESOUNDEXINFO);
+    exinfo.numchannels       = 2;
+    exinfo.defaultfrequency  = 48000;
+    exinfo.format            = FMOD_SOUND_FORMAT_PCMFLOAT;
+    exinfo.decodebuffersize  = 1024;  /* ~21 ms de buffer interno */
+    exinfo.length            = exinfo.defaultfrequency * exinfo.numchannels *
+                               sizeof(float) * 2;  /* 2 segundos de "longitud virtual" */
+    exinfo.pcmreadcallback   = bridge_pcm_read;
+
+    FMOD_RESULT result = g_api.create_sound(
+        core, NULL,
+        FMOD_OPENUSER | FMOD_CREATESTREAM | FMOD_LOOP_NORMAL,
+        &exinfo, &g_bridge_sound);
+
+    if (result != FMOD_OK || !g_bridge_sound) {
+        cabin_log("Bridge: could not create Sound (FMOD result %d).", result);
+        return false;
+    }
+
+    result = g_api.play_sound(core, g_bridge_sound, g_radio_group, 0, &g_bridge_channel);
+    if (result != FMOD_OK || !g_bridge_channel) {
+        cabin_log("Bridge: could not play Sound (FMOD result %d).", result);
+        g_api.sound_release(g_bridge_sound);
+        g_bridge_sound = NULL;
+        return false;
+    }
+
+    if (g_api.channel_set_volume) {
+        g_api.channel_set_volume(g_bridge_channel, 1.0f);
+    }
+
+    cabin_log("Bridge: external audio playing on bus:/radio.");
+    g_bridge_enabled = true;
+    return true;
+}
+
+/*
+ * Llamada desde cabin_after_update: revisa si hay un productor conectado.
+ */
+static void bridge_update(FMOD_SYSTEM *core) {
+    /* Reintentar abrir el mapping cada ~2 segundos */
+    if (!g_bridge) {
+        if ((g_bridge_retry++ % 60) == 0) {
+            if (bridge_open()) {
+                bridge_try_start(core);
+            }
+        }
+        return;
+    }
+
+    /* Verificar que el productor sigue vivo */
+    if (!g_bridge->capturing) {
+        /* El productor dejó de capturar; lo consideramos desconectado */
+        if (g_bridge_enabled) {
+            cabin_log("Bridge: producer stopped capturing.");
+            g_bridge_enabled = false;
+        }
+    } else if (!g_bridge_enabled && g_bridge_sound) {
+        /* El productor volvió; reactivar */
+        g_bridge_enabled = true;
+        cabin_log("Bridge: producer resumed.");
+    }
+
+    /* Write-back del estado para el productor */
+    if (g_bridge_channel && g_api.channel_is_playing) {
+        int playing = 0;
+        g_api.channel_is_playing(g_bridge_channel, &playing);
+        g_bridge->playing = playing ? 1 : 0;
+    }
+    g_bridge->underruns = g_bridge_underruns;
+}
+
+#endif /* _WIN32 */
+
 static uint64_t g_last_cfg_mtime = 0;
 static unsigned int g_cfg_tick = 0;
 
@@ -913,6 +1211,10 @@ static bool try_install(FMOD_STUDIO_SYSTEM *studio) {
         }
     }
 
+#ifdef _WIN32
+    g_radio_group = group;  /* guardar para el bridge */
+#endif
+
     FMOD_SYSTEM *core = NULL;
     result = g_api.get_core(studio, &core);
     if (result != FMOD_OK || !core) {
@@ -963,6 +1265,12 @@ static bool try_install(FMOD_STUDIO_SYSTEM *studio) {
             cabin_log("Camera head-tracking active (cabin_rot=%.2f, front L/R + rear L/R + sub).", init_final);
             update_spatial_state(studio);
         }
+#ifdef _WIN32
+        /* Intentar conectar el bridge de audio externo */
+        if (bridge_open()) {
+            bridge_try_start(core);
+        }
+#endif
         return true;
     }
 
@@ -979,6 +1287,15 @@ static void cabin_after_update(FMOD_STUDIO_SYSTEM *studio, const char *hook_name
 
     if (g_installed) {
         update_spatial_state(studio);
+#ifdef _WIN32
+        /* Actualizar el bridge de audio externo */
+        {
+            FMOD_SYSTEM *core = NULL;
+            if (g_api.get_core && g_api.get_core(studio, &core) == FMOD_OK && core) {
+                bridge_update(core);
+            }
+        }
+#endif
         return;
     }
 
