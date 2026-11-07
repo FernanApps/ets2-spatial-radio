@@ -64,9 +64,9 @@ typedef struct CabinBridgeBlock {
     uint32_t capturing;       /* 1 = WASAPI está entregando paquetes */
 
     /* --- Control de mezcla (el productor actualiza) --- */
-    float    radio_volume;    /* 0.0 - 1.0, volumen de la emisora del juego (1.0 = sin cambio) */
+    float    radio_volume;    /* 0.0 - 1.0, factor sobre el volumen ORIGINAL (1.0 = sin cambio) */
     uint32_t mute_game_radio; /* 1 = silenciar emisora del juego cuando hay audio externo */
-    float    duck_factor;     /* 0.0 - 1.0, factor de atenuación de la emisora (0.0 = silenciar) */
+    float    duck_factor;     /* 0.0 - 1.0, factor adicional de atenuación (multiplicativo) */
     uint32_t _reserved1;      /* padding para alineación */
 
     /* --- Read-back del consumidor (el consumidor escribe) --- */

@@ -326,6 +326,7 @@ static BusSetVolumeFn g_bus_set_volume = NULL;
 static BusSetMuteFn g_bus_set_mute = NULL;
 static void *g_game_radio_bus = NULL;  /* Puntero al fmod_bus_t del juego */
 static float g_original_radio_volume = 1.0f;
+static float g_current_radio_volume = 1.0f;  /* volumen actualmente aplicado */
 static bool g_radio_muted_by_us = false;
 #endif
 
@@ -1123,21 +1124,37 @@ static void bridge_update(FMOD_SYSTEM *core) {
     }
 
     /* Controlar la emisora del juego según parámetros del bridge */
-    if (g_bridge_enabled) {
-        if (g_bridge->mute_game_radio) {
-            /* Silenciar completamente la emisora */
-            radio_mute_game_station(true);
-        } else if (g_bridge->radio_volume >= 0.0f) {
-            /* Aplicar el volumen especificado (con duck_factor si está activo) */
-            float target_vol = g_bridge->radio_volume;
-            if (g_bridge->duck_factor > 0.0f && g_bridge->duck_factor < 1.0f) {
-                target_vol *= g_bridge->duck_factor;
-            }
-            radio_set_game_volume(target_vol);
+    if (g_bridge_enabled && g_game_radio_bus) {
+        /* Guardar volumen original si es la primera vez */
+        if (!g_radio_muted_by_us) {
+            float *vol_ptr = (float *)((char *)g_game_radio_bus + BUS_OFF_VOLUME);
+            g_original_radio_volume = *vol_ptr;
+            g_radio_muted_by_us = true;
+            cabin_log("Radio control: saving original volume %.2f", g_original_radio_volume);
         }
-    } else if (was_enabled) {
+
+        /* Calcular volumen objetivo como factor del original */
+        float factor = 1.0f;
+        if (g_bridge->mute_game_radio) {
+            factor = 0.0f;
+        } else {
+            /* radio_volume es un factor (0.0-1.0) del volumen original */
+            factor = g_bridge->radio_volume;
+            if (factor < 0.0f) factor = 1.0f;  /* default: sin cambio */
+            if (factor > 1.0f) factor = 1.0f;
+            /* duck_factor se aplica adicionalmente */
+            if (g_bridge->duck_factor >= 0.0f && g_bridge->duck_factor < 1.0f) {
+                factor *= g_bridge->duck_factor;
+            }
+        }
+        float target_vol = g_original_radio_volume * factor;
+        radio_set_game_volume(target_vol);
+
+    } else if (was_enabled && g_radio_muted_by_us) {
         /* Audio externo paró: restaurar la emisora del juego */
-        radio_mute_game_station(false);
+        radio_set_game_volume(g_original_radio_volume);
+        g_radio_muted_by_us = false;
+        cabin_log("Radio control: restored volume to %.2f", g_original_radio_volume);
     }
 
     /* Volumen del canal de audio externo */
@@ -1155,7 +1172,7 @@ static void bridge_update(FMOD_SYSTEM *core) {
         g_bridge->playing = playing ? 1 : 0;
     }
     g_bridge->underruns = g_bridge_underruns;
-    g_bridge->actual_radio_vol = g_radio_muted_by_us ? 0.0f : g_original_radio_volume;
+    g_bridge->actual_radio_vol = g_current_radio_volume;
     g_bridge->radio_control_ok = g_game_radio_bus ? 1 : 0;
 }
 
@@ -1201,6 +1218,7 @@ static void radio_set_game_volume(float volume) {
     if (!fmod_bus_ptr || !*fmod_bus_ptr) return;
 
     g_bus_set_volume(*fmod_bus_ptr, volume);
+    g_current_radio_volume = volume;
 }
 
 static void radio_mute_game_station(bool mute) {
