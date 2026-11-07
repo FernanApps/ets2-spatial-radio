@@ -15,6 +15,7 @@ Requisitos: Python 3.8+ (usa ctypes, no necesita instalar nada)
 """
 
 import ctypes
+import ctypes.wintypes
 import struct
 import math
 import time
@@ -67,11 +68,13 @@ OFF_DATA = 208
 # Windows API
 kernel32 = ctypes.windll.kernel32
 
-PAGE_READWRITE = 0x04
 FILE_MAP_ALL_ACCESS = 0xF001F
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 running = True
+
+def memory_barrier():
+    """Memory barrier - no-op en Python, los writes a memoria compartida son atómicos."""
+    pass
 
 def signal_handler(sig, frame):
     global running
@@ -104,18 +107,31 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Crear el mapping
-    handle = kernel32.CreateFileMappingW(
-        INVALID_HANDLE_VALUE,
-        None,
-        PAGE_READWRITE,
-        0,
-        CABIN_BRIDGE_SIZE,
-        CABIN_BRIDGE_NAME
-    )
+    # Abrir el mapping creado por ETS2CabinDSP.dll
+    kernel32.OpenFileMappingW.argtypes = [
+        ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR
+    ]
+    kernel32.OpenFileMappingW.restype = ctypes.wintypes.HANDLE
+
+    # MapViewOfFile necesita restype correcto para 64-bit
+    kernel32.MapViewOfFile.argtypes = [
+        ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.c_size_t
+    ]
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+
+    print("Esperando que ETS2 cree el mapping...")
+    handle = None
+    for attempt in range(60):  # 60 segundos max
+        handle = kernel32.OpenFileMappingW(FILE_MAP_ALL_ACCESS, False, CABIN_BRIDGE_NAME)
+        if handle:
+            break
+        time.sleep(1)
+        if attempt % 5 == 4:
+            print(f"  ...esperando ({attempt + 1}s)")
 
     if not handle:
-        print(f"Error: no se pudo crear el mapping ({kernel32.GetLastError()})")
+        print("Error: ETS2 no creó el mapping. ¿Está corriendo el juego con el plugin?")
         return 1
 
     # Mapear la memoria
@@ -127,11 +143,14 @@ def main():
 
     # Crear un buffer para acceder a la memoria
     buf = (ctypes.c_char * CABIN_BRIDGE_SIZE).from_address(ptr)
-
-    # Inicializar el header
     pid = kernel32.GetCurrentProcessId()
 
-    # Escribir campos del header
+    # Iniciar desde el write_pos actual (si lo hay) o 0
+    write_pos = struct.unpack_from("<q", buf, OFF_WRITE_POS)[0]
+    if write_pos < 0:
+        write_pos = 0
+
+    # Escribir nuestro header (el consumidor ya inicializó el mapping)
     struct.pack_into("<I", buf, OFF_SAMPLE_RATE, 48000)
     struct.pack_into("<I", buf, OFF_CHANNELS, 2)
     struct.pack_into("<f", buf, OFF_GAIN, args.gain)
@@ -139,21 +158,18 @@ def main():
     struct.pack_into("<I", buf, OFF_SOURCE_PID, pid)
     struct.pack_into("<I", buf, OFF_CAPTURING, 1)
 
-    # Nuevos campos de control de radio (version 2)
+    # Campos de control de radio
     struct.pack_into("<f", buf, OFF_RADIO_VOLUME, args.radio_vol)
     struct.pack_into("<I", buf, OFF_MUTE_GAME_RADIO, 1 if args.mute_radio else 0)
     struct.pack_into("<f", buf, OFF_DUCK_FACTOR, args.duck)
 
-    struct.pack_into("<q", buf, OFF_WRITE_POS, 0)
-    struct.pack_into("<q", buf, OFF_READ_POS, 0)
-
-    # Publicar magic y version al final
-    ctypes.windll.kernel32.MemoryBarrier()
+    # Publicar magic y version para indicar que estamos conectados
+    memory_barrier()
     struct.pack_into("<I", buf, OFF_MAGIC, CABIN_BRIDGE_MAGIC)
     struct.pack_into("<I", buf, OFF_VERSION, CABIN_BRIDGE_VERSION)
 
-    print(f"Mapping creado: {CABIN_BRIDGE_NAME} (version {CABIN_BRIDGE_VERSION})")
-    print("Esperando que ETS2CabinDSP.dll lo abra...\n")
+    print(f"Conectado al bridge (version {CABIN_BRIDGE_VERSION})")
+    print("Generando audio...\n")
 
     # Generar el tono
     sample_rate = 48000.0
@@ -163,7 +179,7 @@ def main():
     start_time = time.time()
     last_status = 0
     total_written = 0
-    write_pos = 0
+    # write_pos ya se leyó arriba
 
     while running:
         # Leer read_pos del consumidor
@@ -189,7 +205,7 @@ def main():
                 phase -= 2.0 * math.pi
 
         # Publicar write_pos
-        ctypes.windll.kernel32.MemoryBarrier()
+        memory_barrier()
         write_pos += to_write
         struct.pack_into("<q", buf, OFF_WRITE_POS, write_pos)
         total_written += to_write
@@ -218,7 +234,7 @@ def main():
     # Limpiar
     struct.pack_into("<I", buf, OFF_CAPTURING, 0)
     struct.pack_into("<I", buf, OFF_ENABLED, 0)
-    ctypes.windll.kernel32.MemoryBarrier()
+    memory_barrier()
 
     print("\nCerrando...")
     time.sleep(0.1)

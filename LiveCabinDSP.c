@@ -29,6 +29,9 @@
 /* Contrato de memoria compartida para audio externo (Chrome, Spotify, etc.) */
 #include "cabin_bridge.h"
 
+/* Tipos mínimos del SCS Telemetry SDK */
+#include "scs_sdk_c.h"
+
 /*
  * ETS2 Cabin Radio — 3D Multi-Speaker Truck/Car Cabin Audio Processor
  * (macOS x86_64 & Windows x64)
@@ -298,19 +301,24 @@ static CabinBridgeBlock *g_bridge = NULL;
 static FMOD_SOUND *g_bridge_sound = NULL;
 static FMOD_CHANNEL *g_bridge_channel = NULL;
 static FMOD_CHANNELGROUP *g_radio_group = NULL;
-static bool g_bridge_enabled = false;
+static volatile bool g_bridge_enabled = false;
+static volatile unsigned int g_bridge_mix_count = 0;  /* debug: cuántas muestras se mezclaron */
+static volatile unsigned int g_dsp_call_count = 0;    /* debug: cuántas veces se llamó el DSP */
 static int64_t g_bridge_read_pos = 0;
 static uint32_t g_bridge_underruns = 0;
 static unsigned int g_bridge_retry = 0;
 
 /*
- * Direcciones del juego para control de radio (ETS2 1.62.1.0s).
- * Estas direcciones pueden cambiar entre versiones del juego.
+ * Offsets del juego para control de radio (ETS2 1.62.1.0s).
+ * Relativas a la base del exe (0x140000000 en Ghidra).
+ * Usar GetModuleHandle(NULL) + offset en runtime.
  */
-#define GAME_BUS_ARRAY_PTR      0x1430b5850
-#define GAME_FMOD_STUDIO_PTR    0x1430b5948
-#define GAME_FMOD_CORE_PTR      0x1430b5950
+#define GAME_IMAGE_BASE         0x140000000ULL
+#define GAME_SOUND_STATE_OFF    (0x1430b5940 - GAME_IMAGE_BASE)
+#define GAME_BUS_ARRAY_OFF      (0x1430b5850 - GAME_IMAGE_BASE)
 #define GAME_RADIO_BUS_INDEX    26
+
+static char *g_game_base = NULL;  /* Base real del exe */
 
 /* Offsets en fmod_bus_t */
 #define BUS_OFF_VOLUME          0x04
@@ -607,6 +615,8 @@ static FMOD_RESULT cabin_spatial_dsp_read(
         return FMOD_OK;
     }
 
+    g_dsp_call_count++;
+
     CabinDSPState *st = &g_dsp_state;
     SpatialTargets tgt = g_targets;
     if (!st->initialized) {
@@ -630,6 +640,23 @@ static FMOD_RESULT cabin_spatial_dsp_read(
     for (unsigned int i = 0; i < length; i++) {
         float in_L = inbuffer[i * inchannels + 0];
         float in_R = inbuffer[i * inchannels + 1];
+
+        /* REEMPLAZAR audio de la radio con audio externo del bridge */
+        if (g_bridge && g_bridge_enabled && g_bridge->capturing) {
+            int64_t avail = g_bridge->write_pos - g_bridge_read_pos;
+            if (avail > 0) {
+                if (avail > (int64_t)(CABIN_BRIDGE_TARGET_LATENCY * 2)) {
+                    g_bridge_read_pos = g_bridge->write_pos - CABIN_BRIDGE_TARGET_LATENCY;
+                }
+                uint32_t idx = cabin_bridge_index(g_bridge_read_pos);
+                float gain = g_bridge->gain;
+                /* Reemplazar, no sumar - el bridge ES la radio */
+                in_L = g_bridge->data[idx + 0] * gain;
+                in_R = g_bridge->data[idx + 1] * gain;
+                g_bridge_read_pos++;
+                g_bridge_mix_count++;
+            }
+        }
 
         /* Smoothly interpolate spatial targets sample-by-sample (click-free head turns). */
         for (int s = 0; s < 4; s++) {
@@ -721,6 +748,13 @@ static FMOD_RESULT cabin_spatial_dsp_read(
         }
 
         st->write_pos = (wp + 1u) & CABIN_DELAY_MASK;
+    }
+
+    /* Publicar read_pos del bridge para que el productor sepa cuánto consumimos */
+    if (g_bridge && g_bridge_enabled) {
+        MemoryBarrier();
+        g_bridge->read_pos = g_bridge_read_pos;
+        g_bridge->playing = 1;
     }
 
     return FMOD_OK;
@@ -924,33 +958,45 @@ static void bridge_close(void) {
     g_bridge_read_pos = 0;
 }
 
-static bool bridge_open(void) {
+static bool bridge_create(void) {
     if (g_bridge) return true;
 
-    g_bridge_handle = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
-                                        CABIN_BRIDGE_NAME);
-    if (!g_bridge_handle) return false;
+    /* La DLL CREA el mapping; el productor lo ABRE para escribir */
+    g_bridge_handle = CreateFileMappingA(
+        INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+        0, CABIN_BRIDGE_SIZE, CABIN_BRIDGE_NAME);
+    if (!g_bridge_handle) {
+        cabin_log("Bridge: CreateFileMapping failed (%lu).", GetLastError());
+        return false;
+    }
 
     g_bridge = (CabinBridgeBlock *)MapViewOfFile(
-        g_bridge_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, CABIN_BRIDGE_SIZE);
+        g_bridge_handle, FILE_MAP_ALL_ACCESS, 0, 0, CABIN_BRIDGE_SIZE);
     if (!g_bridge) {
+        cabin_log("Bridge: MapViewOfFile failed (%lu).", GetLastError());
         CloseHandle(g_bridge_handle);
         g_bridge_handle = NULL;
         return false;
     }
 
-    if (!cabin_bridge_valid(g_bridge)) {
-        cabin_log("Bridge: invalid magic/version/channels, ignoring.");
-        UnmapViewOfFile(g_bridge);
-        g_bridge = NULL;
-        CloseHandle(g_bridge_handle);
-        g_bridge_handle = NULL;
-        return false;
-    }
+    /* Inicializar el header; el productor lo sobreescribirá cuando conecte */
+    memset(g_bridge, 0, sizeof(CabinBridgeBlock));
+    g_bridge->sample_rate = 48000;
+    g_bridge->channels = 2;
+    g_bridge->gain = 1.0f;
+    g_bridge->radio_volume = 1.0f;
+    g_bridge->duck_factor = 1.0f;
 
-    g_bridge_read_pos = g_bridge->write_pos;  /* empezar desde el final, sin latencia acumulada */
-    cabin_log("Bridge: connected to external audio source (pid %u).", g_bridge->source_pid);
+    cabin_log("Bridge: mapping created, waiting for producer...");
     return true;
+}
+
+/* Verifica si hay un productor conectado */
+static bool bridge_has_producer(void) {
+    if (!g_bridge) return false;
+    return g_bridge->magic == CABIN_BRIDGE_MAGIC &&
+           g_bridge->version == CABIN_BRIDGE_VERSION &&
+           g_bridge->capturing;
 }
 
 /*
@@ -1021,8 +1067,8 @@ static bool bridge_try_start(FMOD_SYSTEM *core) {
 
     /* cbsize: tamaño del struct */
     *(int *)(exinfo + EXINFO_OFF_CBSIZE) = EXINFO_SIZE;
-    /* length: tamaño en bytes del audio virtual (2 segundos) */
-    *(unsigned int *)(exinfo + EXINFO_OFF_LENGTH) = 48000 * 2 * sizeof(float) * 2;
+    /* length: 0 para stream de tamaño desconocido */
+    *(unsigned int *)(exinfo + EXINFO_OFF_LENGTH) = 0;
     /* numchannels */
     *(int *)(exinfo + EXINFO_OFF_NUMCHANNELS) = 2;
     /* defaultfrequency */
@@ -1030,16 +1076,23 @@ static bool bridge_try_start(FMOD_SYSTEM *core) {
     /* format = FMOD_SOUND_FORMAT_PCMFLOAT */
     *(int *)(exinfo + EXINFO_OFF_FORMAT) = FMOD_SOUND_FORMAT_PCMFLOAT;
     /* decodebuffersize */
-    *(unsigned int *)(exinfo + EXINFO_OFF_DECODEBUFSIZE) = 1024;
-    /* pcmreadcallback */
-    *(FMOD_SOUND_PCMREAD_CALLBACK *)(exinfo + EXINFO_OFF_PCMREADCB) = bridge_pcm_read;
+    *(unsigned int *)(exinfo + EXINFO_OFF_DECODEBUFSIZE) = 4096;
+    /* SIN callback por ahora - probar si los offsets básicos funcionan */
+    /* *(FMOD_SOUND_PCMREAD_CALLBACK *)(exinfo + EXINFO_OFF_PCMREADCB) = bridge_pcm_read; */
 
     cabin_log("Bridge: creating sound - exinfo=%d bytes, core=%p, group=%p",
               EXINFO_SIZE, (void*)core, (void*)g_radio_group);
+    cabin_log("Bridge: exinfo: cbsize=%d, len=%d, ch=%d, freq=%d, fmt=%d, decbuf=%d (NO callback test)",
+              *(int*)(exinfo + EXINFO_OFF_CBSIZE),
+              *(unsigned int*)(exinfo + EXINFO_OFF_LENGTH),
+              *(int*)(exinfo + EXINFO_OFF_NUMCHANNELS),
+              *(int*)(exinfo + EXINFO_OFF_DEFAULTFREQ),
+              *(int*)(exinfo + EXINFO_OFF_FORMAT),
+              *(unsigned int*)(exinfo + EXINFO_OFF_DECODEBUFSIZE));
 
     /* Intentar con PCMFLOAT primero */
     FMOD_RESULT result = g_api.create_sound(
-        core, "",  /* nombre vacío para OPENUSER */
+        core, NULL,  /* NULL para OPENUSER */
         FMOD_OPENUSER | FMOD_CREATESTREAM | FMOD_LOOP_NORMAL | FMOD_2D,
         exinfo, &g_bridge_sound);
 
@@ -1049,15 +1102,15 @@ static bool bridge_try_start(FMOD_SYSTEM *core) {
         /* Fallback a PCM16 que tiene mejor compatibilidad */
         memset(exinfo, 0, EXINFO_SIZE);
         *(int *)(exinfo + EXINFO_OFF_CBSIZE) = EXINFO_SIZE;
-        *(unsigned int *)(exinfo + EXINFO_OFF_LENGTH) = 48000 * 2 * 2 * 2; /* 2 bytes per sample */
+        *(unsigned int *)(exinfo + EXINFO_OFF_LENGTH) = 0; /* stream de tamaño desconocido */
         *(int *)(exinfo + EXINFO_OFF_NUMCHANNELS) = 2;
         *(int *)(exinfo + EXINFO_OFF_DEFAULTFREQ) = 48000;
         *(int *)(exinfo + EXINFO_OFF_FORMAT) = 2;  /* FMOD_SOUND_FORMAT_PCM16 */
-        *(unsigned int *)(exinfo + EXINFO_OFF_DECODEBUFSIZE) = 1024;
-        *(FMOD_SOUND_PCMREAD_CALLBACK *)(exinfo + EXINFO_OFF_PCMREADCB) = bridge_pcm_read;
+        *(unsigned int *)(exinfo + EXINFO_OFF_DECODEBUFSIZE) = 4096;
+        /* SIN callback */
 
         result = g_api.create_sound(
-            core, "",
+            core, NULL,
             FMOD_OPENUSER | FMOD_CREATESTREAM | FMOD_LOOP_NORMAL | FMOD_2D,
             exinfo, &g_bridge_sound);
 
@@ -1094,27 +1147,47 @@ static void radio_mute_game_station(bool mute);
  * Llamada desde cabin_after_update: revisa si hay un productor conectado.
  */
 static void bridge_update(FMOD_SYSTEM *core) {
-    /* Reintentar abrir el mapping cada ~2 segundos */
-    if (!g_bridge) {
-        if ((g_bridge_retry++ % 60) == 0) {
-            if (bridge_open()) {
-                bridge_try_start(core);
-            }
-        }
-        return;
+    /* Crear el mapping si no existe (solo una vez) */
+    static bool bridge_created = false;
+    if (!bridge_created) {
+        bridge_created = bridge_create();
+        if (!bridge_created) return;
+    }
+    if (!g_bridge) return;
+
+    /* Intentar inicializar control de radio (solo cuando el sistema está listo) */
+    if (!g_game_radio_bus) {
+        radio_control_init();  /* Retorna false si el sistema no está listo */
     }
 
-    /* Inicializar control de radio si no está listo */
-    static bool radio_init_tried = false;
-    if (!radio_init_tried) {
-        radio_init_tried = true;
-        radio_control_init();
+    /* Verificar si hay un productor conectado */
+    bool producer_active = bridge_has_producer();
+
+    /* Si el productor acaba de conectar, inicializar lectura */
+    if (producer_active && !g_bridge_enabled) {
+        g_bridge_read_pos = g_bridge->write_pos;  /* empezar desde el final */
+        g_bridge_mix_count = 0;
+        cabin_log("Bridge: producer connected (pid %u). capturing=%d, enabled will be set.",
+                  g_bridge->source_pid, g_bridge->capturing);
+        g_bridge_enabled = true;
+    }
+
+    /* Log periódico del estado de mezcla */
+    static unsigned int last_mix_log = 0;
+    static unsigned int last_call_log = 0;
+    if (g_bridge_enabled && g_bridge_mix_count > last_mix_log + 48000) {
+        unsigned int calls_per_sec = g_dsp_call_count - last_call_log;
+        cabin_log("Bridge: mix=%u, calls=%u/s, avail=%lld",
+                  g_bridge_mix_count, calls_per_sec,
+                  (long long)(g_bridge->write_pos - g_bridge_read_pos));
+        last_mix_log = g_bridge_mix_count;
+        last_call_log = g_dsp_call_count;
     }
 
     /* Verificar que el productor sigue vivo */
     bool was_enabled = g_bridge_enabled;
-    if (!g_bridge->capturing) {
-        /* El productor dejó de capturar; lo consideramos desconectado */
+    if (!producer_active || !g_bridge->capturing) {
+        /* El productor dejó de capturar o desconectó */
         if (g_bridge_enabled) {
             cabin_log("Bridge: producer stopped capturing.");
             g_bridge_enabled = false;
@@ -1208,15 +1281,33 @@ static void bridge_update(FMOD_SYSTEM *core) {
 static bool radio_control_init(void) {
     if (g_game_radio_bus) return true;
 
-    /* Intentar leer el array de buses del juego */
-    uint64_t *bus_array_ptr = (uint64_t *)GAME_BUS_ARRAY_PTR;
-    if (!bus_array_ptr || !*bus_array_ptr) {
+    /* Obtener la base real del ejecutable (ASLR) */
+    if (!g_game_base) {
+        g_game_base = (char *)GetModuleHandleA(NULL);
+        if (!g_game_base) {
+            cabin_log("Radio control: cannot get module base.");
+            return false;
+        }
+        cabin_log("Radio control: exe base = %p", g_game_base);
+    }
+
+    /* Verificar que el sistema de sonido esté inicializado (estado == 2) */
+    uint32_t *state_ptr = (uint32_t *)(g_game_base + GAME_SOUND_STATE_OFF);
+    if (*state_ptr != 2) {
+        return false;  /* Sistema no listo, reintentar después */
+    }
+
+    /* Leer el array de buses del juego */
+    uint64_t *bus_array_ptr = (uint64_t *)(g_game_base + GAME_BUS_ARRAY_OFF);
+    if (!*bus_array_ptr) {
+        cabin_log("Radio control: bus array not found.");
         return false;
     }
 
     uint64_t bus_array = *bus_array_ptr;
     uint64_t *radio_bus_ptr = (uint64_t *)(bus_array + GAME_RADIO_BUS_INDEX * 8);
     if (!radio_bus_ptr || !*radio_bus_ptr) {
+        cabin_log("Radio control: radio bus (index %d) not found.", GAME_RADIO_BUS_INDEX);
         return false;
     }
 
@@ -1441,10 +1532,7 @@ static bool try_install(FMOD_STUDIO_SYSTEM *studio) {
             update_spatial_state(studio);
         }
 #ifdef _WIN32
-        /* Intentar conectar el bridge de audio externo */
-        if (bridge_open()) {
-            bridge_try_start(core);
-        }
+        /* El bridge se crea y maneja en bridge_update() */
 #endif
         return true;
     }
@@ -1460,17 +1548,21 @@ static void cabin_after_update(FMOD_STUDIO_SYSTEM *studio, const char *hook_name
     }
     if (g_dry_run || g_disabled || !studio) return;
 
+#ifdef _WIN32
+    /* Siempre actualizar el bridge (independiente de si el DSP está instalado) */
+    {
+        /* Asegurar que los símbolos estén cargados */
+        if (!g_symbols_resolved) resolve_symbols();
+
+        FMOD_SYSTEM *core = NULL;
+        if (g_api.get_core && g_api.get_core(studio, &core) == FMOD_OK && core) {
+            bridge_update(core);
+        }
+    }
+#endif
+
     if (g_installed) {
         update_spatial_state(studio);
-#ifdef _WIN32
-        /* Actualizar el bridge de audio externo */
-        {
-            FMOD_SYSTEM *core = NULL;
-            if (g_api.get_core && g_api.get_core(studio, &core) == FMOD_OK && core) {
-                bridge_update(core);
-            }
-        }
-#endif
         return;
     }
 
@@ -1639,15 +1731,15 @@ static void start_windows_hook_once(const char *source) {
     if (thread) CloseHandle((HANDLE)thread);
 }
 
-/* Optional SCS Telemetry SDK plugin entry points (for bin\win_x64\plugins\ auto-load). */
-__declspec(dllexport) int __cdecl scs_telemetry_init(int version, const void *params) {
+/* SCS Telemetry SDK plugin entry points (bin\win_x64\plugins\ auto-load). */
+__declspec(dllexport) SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_init_params_v100_t *const params) {
     (void)version;
     (void)params;
     start_windows_hook_once("SCS Plugin");
-    return 0; /* SCS_RESULT_ok */
+    return SCS_RESULT_ok;
 }
 
-__declspec(dllexport) void __cdecl scs_telemetry_shutdown(void) {
+__declspec(dllexport) SCSAPI_VOID scs_telemetry_shutdown(void) {
     cabin_log("SCS plugin shutdown notification received.");
 }
 
