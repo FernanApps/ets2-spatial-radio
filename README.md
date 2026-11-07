@@ -37,6 +37,11 @@ ETS2 Cabin Radio attaches directly to FMOD's `bus:/radio` channel inside the run
   - Leaves game files, audio files, Steam achievements, and telemetry untouched.
   - Leaves game engine sounds, turbo spool, tire noise, and ambient world audio buses completely unaffected.
 
+- **External Audio Bridge** (NEW):
+  - Play audio from external apps (Chrome, YouTube, Spotify) through the in-game truck radio with full 3D cabin processing.
+  - An external producer writes audio samples to a shared memory ring buffer; the DLL reads and plays them on `bus:/radio`.
+  - See `cabin_bridge.h` for the IPC contract and `tools/bridge_test.c` for a test tone producer.
+
 ---
 
 ## 🎛️ Sound Presets
@@ -143,18 +148,23 @@ zig cc -target x86_64-windows-gnu -O2 -Wall -Wextra -Wl,--subsystem,windows \
 
 ```text
 ets2-spatial-radio/
-├── LiveCabinDSP.c     # Core 4.1-cabin 3D audio DSP & FMOD real-time hooking engine
-├── windows_main.c     # Native Windows Win32 companion launcher GUI & injection loader
-├── main.swift         # Native macOS SwiftUI companion launcher & live manager
-├── Info.plist         # macOS application bundle manifest
-├── app.ico            # Windows application icon
-├── app.res            # Windows compiled resource file (icons, metadata)
-├── AppIcon.png        # macOS application icon asset
-├── build-macos.sh     # macOS automated build and signing script
-├── build-windows.sh   # Windows cross-compilation build script
-├── RELEASE_NOTES.md   # Release notes for version 1.2.0
-├── LICENSE            # GNU General Public License v3.0 (GPL-3.0)
-└── README.md          # Project documentation
+├── LiveCabinDSP.c       # Core 4.1-cabin 3D audio DSP & FMOD real-time hooking engine
+├── cabin_bridge.h       # IPC contract for external audio (shared memory ring buffer)
+├── windows_main.c       # Native Windows Win32 companion launcher GUI & injection loader
+├── main.swift           # Native macOS SwiftUI companion launcher & live manager
+├── Info.plist           # macOS application bundle manifest
+├── app.ico              # Windows application icon
+├── app.res              # Windows compiled resource file (icons, metadata)
+├── AppIcon.png          # macOS application icon asset
+├── build-macos.sh       # macOS automated build and signing script
+├── build-windows.sh     # Windows cross-compilation build script
+├── tools/
+│   └── bridge_test.c    # Test tone producer (440 Hz) for validating the audio bridge
+├── HALLAZGOS.md         # Ghidra analysis of ETS2 FMOD internals (Spanish)
+├── PLAN_AUDIO_EXTERNO.md# Architecture plan for external audio bridge (Spanish)
+├── RELEASE_NOTES.md     # Release notes for version 1.2.0
+├── LICENSE              # GNU General Public License v3.0 (GPL-3.0)
+└── README.md            # Project documentation
 ```
 
 ---
