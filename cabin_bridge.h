@@ -28,7 +28,7 @@ extern "C" {
 
 /* Versión del layout. Si cambia el struct, subir esto. El consumidor ignora
    versiones que no reconoce. */
-#define CABIN_BRIDGE_VERSION 1
+#define CABIN_BRIDGE_VERSION 2
 
 /* Capacidad del ring buffer en frames (potencia de 2).
    16384 frames a 48 kHz = ~341 ms de buffer. */
@@ -63,12 +63,20 @@ typedef struct CabinBridgeBlock {
     uint32_t source_pid;      /* PID del proceso capturado (display) */
     uint32_t capturing;       /* 1 = WASAPI está entregando paquetes */
 
+    /* --- Control de mezcla (el productor actualiza) --- */
+    float    radio_volume;    /* 0.0 - 1.0, volumen de la emisora del juego (1.0 = sin cambio) */
+    uint32_t mute_game_radio; /* 1 = silenciar emisora del juego cuando hay audio externo */
+    float    duck_factor;     /* 0.0 - 1.0, factor de atenuación de la emisora (0.0 = silenciar) */
+    uint32_t _reserved1;      /* padding para alineación */
+
     /* --- Read-back del consumidor (el consumidor escribe) --- */
     uint32_t playing;         /* 1 = el Sound de FMOD está sonando */
     uint32_t underruns;       /* contador de underruns (diagnóstico) */
+    float    actual_radio_vol;/* volumen real de la emisora (para debug) */
+    uint32_t radio_control_ok;/* 1 = el control de radio está funcionando */
 
     /* --- Padding para alinear los contadores a 64 bytes (cache line) --- */
-    uint8_t  _pad1[40];
+    uint8_t  _pad1[16];
 
     /* --- Ring buffer SPSC --- */
     volatile int64_t write_pos;  /* frames escritos (monótono), alineado */

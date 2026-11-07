@@ -1084,6 +1084,7 @@ static bool bridge_try_start(FMOD_SYSTEM *core) {
 
 /* Forward declarations para control de radio */
 static bool radio_control_init(void);
+static void radio_set_game_volume(float volume);
 static void radio_mute_game_station(bool mute);
 
 /*
@@ -1121,13 +1122,30 @@ static void bridge_update(FMOD_SYSTEM *core) {
         cabin_log("Bridge: producer resumed.");
     }
 
-    /* Controlar la emisora del juego según estado del audio externo */
-    if (g_bridge_enabled && !was_enabled) {
-        /* Audio externo comenzó: silenciar la emisora del juego */
-        radio_mute_game_station(true);
-    } else if (!g_bridge_enabled && was_enabled) {
+    /* Controlar la emisora del juego según parámetros del bridge */
+    if (g_bridge_enabled) {
+        if (g_bridge->mute_game_radio) {
+            /* Silenciar completamente la emisora */
+            radio_mute_game_station(true);
+        } else if (g_bridge->radio_volume >= 0.0f) {
+            /* Aplicar el volumen especificado (con duck_factor si está activo) */
+            float target_vol = g_bridge->radio_volume;
+            if (g_bridge->duck_factor > 0.0f && g_bridge->duck_factor < 1.0f) {
+                target_vol *= g_bridge->duck_factor;
+            }
+            radio_set_game_volume(target_vol);
+        }
+    } else if (was_enabled) {
         /* Audio externo paró: restaurar la emisora del juego */
         radio_mute_game_station(false);
+    }
+
+    /* Volumen del canal de audio externo */
+    if (g_bridge_channel && g_api.channel_set_volume) {
+        float ext_vol = g_bridge->gain;
+        if (ext_vol < 0.0f) ext_vol = 0.0f;
+        if (ext_vol > 2.0f) ext_vol = 2.0f;
+        g_api.channel_set_volume(g_bridge_channel, ext_vol);
     }
 
     /* Write-back del estado para el productor */
@@ -1137,6 +1155,8 @@ static void bridge_update(FMOD_SYSTEM *core) {
         g_bridge->playing = playing ? 1 : 0;
     }
     g_bridge->underruns = g_bridge_underruns;
+    g_bridge->actual_radio_vol = g_radio_muted_by_us ? 0.0f : g_original_radio_volume;
+    g_bridge->radio_control_ok = g_game_radio_bus ? 1 : 0;
 }
 
 /*

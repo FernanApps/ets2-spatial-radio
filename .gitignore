@@ -1,28 +1,8 @@
-# Build outputs
-ETS2CabinRadio
-libETS2CabinDSP.dylib
-ETS2CabinDSP.dll
-"ETS2 Cabin Radio.exe"
-*.o
+build/
 *.obj
-*.dylib
+*.lib
+*.exp
 *.dll
 *.exe
 *.pdb
-*.lib
-*.exp
-*.app/
-*.zip
-dist/
-
-# Compiler & OS cache
-.module-cache/
-.DS_Store
-*.DS_Store
-Thumbs.db
-ehthumbs.db
-
-# Live settings and logs
-live-settings.env
-*.log
-*.tmp
+*.ilk

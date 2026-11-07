@@ -7,6 +7,9 @@ Sirve para probar ETS2CabinDSP.dll sin tener el plugin capturador real.
 
 Uso:
   python bridge_test.py [--freq 440] [--gain 0.5] [--duration 30]
+  python bridge_test.py --radio-vol 0.3     # bajar volumen de la emisora al 30%
+  python bridge_test.py --mute-radio        # silenciar la emisora del juego
+  python bridge_test.py --duck 0.2          # atenuar emisora al 20% cuando hay audio
 
 Requisitos: Python 3.8+ (usa ctypes, no necesita instalar nada)
 """
@@ -19,21 +22,25 @@ import argparse
 import signal
 import sys
 
-# Constantes de cabin_bridge.h
+# Constantes de cabin_bridge.h (VERSION 2)
 CABIN_BRIDGE_NAME = "Local\\ETS2CabinBridge"
 CABIN_BRIDGE_MAGIC = 0x31424345  # 'ECB1'
-CABIN_BRIDGE_VERSION = 1
+CABIN_BRIDGE_VERSION = 2
 CABIN_BRIDGE_CAPACITY = 16384
 
-# Tamaño del struct CabinBridgeBlock
-# Header: 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 40 = 80 bytes
+# Tamaño del struct CabinBridgeBlock v2
+# Header: 4*4 = 16 bytes
+# Config: 4*4 = 16 bytes
+# Control de mezcla: 4*4 = 16 bytes
+# Read-back: 4*4 = 16 bytes
+# Padding: 16 bytes
 # write_pos: 8 + 56 pad = 64 bytes
 # read_pos: 8 + 56 pad = 64 bytes
 # data: 16384 * 2 * 4 = 131072 bytes
 # Total: 80 + 64 + 64 + 131072 = 131280 bytes
 CABIN_BRIDGE_SIZE = 131280
 
-# Offsets en el struct
+# Offsets en el struct (version 2)
 OFF_MAGIC = 0
 OFF_VERSION = 4
 OFF_SAMPLE_RATE = 8
@@ -42,8 +49,17 @@ OFF_GAIN = 16
 OFF_ENABLED = 20
 OFF_SOURCE_PID = 24
 OFF_CAPTURING = 28
-OFF_PLAYING = 32
-OFF_UNDERRUNS = 36
+# Nuevos campos de control (version 2)
+OFF_RADIO_VOLUME = 32
+OFF_MUTE_GAME_RADIO = 36
+OFF_DUCK_FACTOR = 40
+OFF_RESERVED1 = 44
+# Read-back
+OFF_PLAYING = 48
+OFF_UNDERRUNS = 52
+OFF_ACTUAL_RADIO_VOL = 56
+OFF_RADIO_CONTROL_OK = 60
+# Padding + ring buffer
 OFF_WRITE_POS = 80
 OFF_READ_POS = 144
 OFF_DATA = 208
@@ -67,11 +83,22 @@ def main():
 
     parser = argparse.ArgumentParser(description="Genera un tono y lo escribe al bridge de audio")
     parser.add_argument("--freq", type=float, default=440.0, help="Frecuencia en Hz (default: 440)")
-    parser.add_argument("--gain", type=float, default=0.5, help="Volumen 0.0-1.0 (default: 0.5)")
-    parser.add_argument("--duration", type=int, default=30, help="Duración en segundos (default: 30)")
+    parser.add_argument("--gain", type=float, default=0.5, help="Volumen audio externo 0.0-2.0 (default: 0.5)")
+    parser.add_argument("--duration", type=int, default=0, help="Duración en segundos (0 = infinito)")
+    # Nuevos controles de radio
+    parser.add_argument("--radio-vol", type=float, default=1.0,
+                        help="Volumen de la emisora del juego 0.0-1.0 (default: 1.0)")
+    parser.add_argument("--mute-radio", action="store_true",
+                        help="Silenciar la emisora del juego mientras hay audio externo")
+    parser.add_argument("--duck", type=float, default=1.0,
+                        help="Factor de atenuación de la emisora 0.0-1.0 (default: 1.0 = sin duck)")
     args = parser.parse_args()
 
-    print(f"Bridge Test: tono {args.freq:.0f} Hz, gain {args.gain:.2f}, duración {args.duration} s")
+    print(f"Bridge Test v2: tono {args.freq:.0f} Hz")
+    print(f"  Audio externo: gain={args.gain:.2f}")
+    print(f"  Radio del juego: vol={args.radio_vol:.2f}, mute={args.mute_radio}, duck={args.duck:.2f}")
+    if args.duration > 0:
+        print(f"  Duración: {args.duration} s")
     print("Presiona Ctrl+C para salir.\n")
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -111,6 +138,12 @@ def main():
     struct.pack_into("<I", buf, OFF_ENABLED, 1)
     struct.pack_into("<I", buf, OFF_SOURCE_PID, pid)
     struct.pack_into("<I", buf, OFF_CAPTURING, 1)
+
+    # Nuevos campos de control de radio (version 2)
+    struct.pack_into("<f", buf, OFF_RADIO_VOLUME, args.radio_vol)
+    struct.pack_into("<I", buf, OFF_MUTE_GAME_RADIO, 1 if args.mute_radio else 0)
+    struct.pack_into("<f", buf, OFF_DUCK_FACTOR, args.duck)
+
     struct.pack_into("<q", buf, OFF_WRITE_POS, 0)
     struct.pack_into("<q", buf, OFF_READ_POS, 0)
 
@@ -119,7 +152,7 @@ def main():
     struct.pack_into("<I", buf, OFF_MAGIC, CABIN_BRIDGE_MAGIC)
     struct.pack_into("<I", buf, OFF_VERSION, CABIN_BRIDGE_VERSION)
 
-    print(f"Mapping creado: {CABIN_BRIDGE_NAME}")
+    print(f"Mapping creado: {CABIN_BRIDGE_NAME} (version {CABIN_BRIDGE_VERSION})")
     print("Esperando que ETS2CabinDSP.dll lo abra...\n")
 
     # Generar el tono
@@ -169,9 +202,12 @@ def main():
             buffered = write_pos - read_pos
             playing = struct.unpack_from("<I", buf, OFF_PLAYING)[0]
             underruns = struct.unpack_from("<I", buf, OFF_UNDERRUNS)[0]
+            actual_radio_vol = struct.unpack_from("<f", buf, OFF_ACTUAL_RADIO_VOL)[0]
+            radio_ctrl_ok = struct.unpack_from("<I", buf, OFF_RADIO_CONTROL_OK)[0]
 
-            print(f"  [{elapsed:3d} s] escrito: {total_written} frames, "
-                  f"buffer: {buffered}, playing: {playing}, underruns: {underruns}")
+            radio_info = f"radio_vol={actual_radio_vol:.2f}" if radio_ctrl_ok else "radio_ctrl=OFF"
+            print(f"  [{elapsed:3d} s] buf: {buffered:5d}, play: {playing}, "
+                  f"under: {underruns}, {radio_info}")
 
             if args.duration > 0 and elapsed >= args.duration:
                 print("\nDuración alcanzada.")
