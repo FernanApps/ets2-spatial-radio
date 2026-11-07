@@ -218,6 +218,80 @@ usuario quiere audio externo sin la radio del juego, simplemente no sintoniza ni
 
 ---
 
+---
+
+## Control de Radio desde Código Externo
+
+Análisis adicional con Ghidra para controlar la radio programáticamente.
+
+### Direcciones Globales (ETS2 1.62.1.0s)
+
+| Elemento | Dirección | Descripción |
+|----------|-----------|-------------|
+| Sound Manager | `0x1430b5780` | `prism::sound_manager_t` |
+| Estado del manager | `0x1430b5940` | 0=no init, 1=initializing, 2=ready |
+| Array de buses | `0x1430b5850` | Puntero a array de `fmod_bus_t*` |
+| Count de buses | `0x1430b5858` | 27 buses |
+| FMOD Studio System | `0x1430b5948` | Puntero global |
+| FMOD Core System | `0x1430b5950` | Puntero global |
+| Bus de radio | índice **26** | `"bus:/radio"` |
+
+### Estructura `fmod_bus_t` (0x50 bytes)
+
+```c
+struct fmod_bus_t {
+    int type;                    // +0x00
+    float volume;                // +0x04 (volumen guardado)
+    uint32_t mute_flags;         // +0x08 (bitfield de mute)
+    bool some_flag;              // +0x0C
+    uint64_t fade_end;           // +0x10 (timestamp fin de fade)
+    float target_volume;         // +0x18 (volumen objetivo)
+    float volume_delta;          // +0x1C (incremento por tick)
+    FMOD::Studio::Bus* fmod_bus; // +0x20
+    FMOD_DSP* dsp_lowpass;       // +0x28 (tipo 7)
+    FMOD_DSP* dsp_17;            // +0x30
+    FMOD_DSP* dsp_25;            // +0x38
+    FMOD_DSP* dsp_32;            // +0x40
+    FMOD_CHANNELGROUP* group;    // +0x48
+};
+```
+
+### Funciones del Juego
+
+| Función | Dirección | Signatura | Descripción |
+|---------|-----------|-----------|-------------|
+| Apagar bus | `0x14028e690` | `(fmod_bus_t*, uint32_t flags, float fade)` | `setVolume(0)` + `setMute(true)` |
+| Encender bus | `0x14028e720` | `(fmod_bus_t*, uint32_t flags, float fade)` | `setMute(false)` + fade |
+| Set volumen | `0x14028e560` | `(fmod_bus_t*, float vol, float fade)` | Transición gradual |
+| Control general | `0x14028ddc0` | `(sound_mgr*, bus_id, vol, mute, force)` | Set volumen y mute |
+
+### Cómo Obtener el Bus de Radio
+
+```c
+// Leer el array de buses
+uint64_t bus_array = *(uint64_t*)0x1430b5850;
+// Obtener el bus de radio (índice 26)
+fmod_bus_t* radio_bus = *(fmod_bus_t**)(bus_array + 26 * 8);
+// Obtener el puntero FMOD
+FMOD::Studio::Bus* fmod_bus = *(FMOD::Studio::Bus**)((char*)radio_bus + 0x20);
+// Obtener el ChannelGroup
+FMOD_CHANNELGROUP* group = *(FMOD_CHANNELGROUP**)((char*)radio_bus + 0x48);
+```
+
+### Estrategia para Audio Externo
+
+**Problema:** si silenciamos el bus de radio, también silenciamos nuestro audio externo.
+
+**Solución:** reproducir nuestro audio en el **ChannelGroup padre** (master) en vez del bus de radio,
+aplicando los efectos de cabina manualmente. O:
+
+1. Obtener el volumen actual de la emisora del juego
+2. Cuando hay audio externo, bajar el volumen de la emisora a 0
+3. Nuestro audio va al bus pero con volumen propio
+4. Restaurar el volumen de la emisora cuando no hay audio externo
+
+---
+
 ## Fase 0 completada
 
 Todas las preguntas respondidas. Resumen:

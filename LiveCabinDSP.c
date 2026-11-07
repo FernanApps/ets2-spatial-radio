@@ -65,6 +65,7 @@ enum {
     /* Flags para CreateSound/CreateStream */
     FMOD_DEFAULT = 0x00000000,
     FMOD_LOOP_NORMAL = 0x00000002,
+    FMOD_2D = 0x00000008,
     FMOD_CREATESTREAM = 0x00000080,
     FMOD_OPENUSER = 0x00000100,
     FMOD_SOUND_FORMAT_PCMFLOAT = 5
@@ -72,51 +73,22 @@ enum {
 
 /*
  * FMOD_CREATESOUNDEXINFO para FMOD 2.03.x 64-bit.
- * cbsize = 112 bytes (0x70). Verificado con Ghidra.
+ * Usamos offsets fijos en vez de un struct porque el tamaño varía entre versiones.
+ * FMOD 2.02+ en 64-bit: cbsize = 0xE0 (224 bytes).
  */
 typedef FMOD_RESULT (*FMOD_SOUND_PCMREAD_CALLBACK)(
     FMOD_SOUND *sound, void *data, unsigned int datalen);
-typedef FMOD_RESULT (*FMOD_SOUND_PCMSETPOS_CALLBACK)(
-    FMOD_SOUND *sound, int subsound, unsigned int position, unsigned int postype);
 
-typedef struct {
-    int                           cbsize;
-    unsigned int                  length;
-    unsigned int                  fileoffset;
-    int                           numchannels;
-    int                           defaultfrequency;
-    int                           format;           /* FMOD_SOUND_FORMAT */
-    unsigned int                  decodebuffersize;
-    int                           initialsubsound;
-    int                           numsubsounds;
-    int                          *inclusionlist;
-    int                           inclusionlistnum;
-    FMOD_SOUND_PCMREAD_CALLBACK   pcmreadcallback;
-    FMOD_SOUND_PCMSETPOS_CALLBACK pcmsetposcallback;
-    void                         *nonblockcallback;
-    const char                   *dlsname;
-    const char                   *encryptionkey;
-    int                           maxpolyphony;
-    void                         *userdata;
-    int                           suggestedsoundtype;
-    void                         *fileuseropen;
-    void                         *fileuserclose;
-    void                         *fileuserread;
-    void                         *fileuserseek;
-    void                         *fileuserasyncread;
-    void                         *fileuserasynccancel;
-    void                         *fileuserdata;
-    int                           filebuffersize;
-    int                           channelorder;
-    void                         *initialsoundgroup;
-    unsigned int                  initialseekposition;
-    int                           initialseekpostype;
-    int                           ignoresetfilesystem;
-    unsigned int                  audioqueuepolicy;
-    unsigned int                  minmidigranularity;
-    int                           nonblockthreadid;
-    void                         *fsbguid;
-} FMOD_CREATESOUNDEXINFO;
+/* Offsets en FMOD_CREATESOUNDEXINFO para FMOD 2.x 64-bit */
+#define EXINFO_SIZE              224
+#define EXINFO_OFF_CBSIZE        0
+#define EXINFO_OFF_LENGTH        4
+#define EXINFO_OFF_NUMCHANNELS   12
+#define EXINFO_OFF_DEFAULTFREQ   16
+#define EXINFO_OFF_FORMAT        20
+#define EXINFO_OFF_DECODEBUFSIZE 24
+#define EXINFO_OFF_PCMREADCB     56
+#define EXINFO_OFF_USERDATA      104
 
 enum {
     EQ_LOWGAIN = 0,
@@ -192,7 +164,7 @@ typedef FMOD_RESULT (*GetVersionFn)(FMOD_SYSTEM *, unsigned int *, unsigned int 
 
 /* Funciones para reproducir audio externo (bridge) */
 typedef FMOD_RESULT (*CreateSoundFn)(FMOD_SYSTEM *, const char *, unsigned int,
-                                      FMOD_CREATESOUNDEXINFO *, FMOD_SOUND **);
+                                      void *, FMOD_SOUND **);
 typedef FMOD_RESULT (*PlaySoundFn)(FMOD_SYSTEM *, FMOD_SOUND *, FMOD_CHANNELGROUP *,
                                     int, FMOD_CHANNEL **);
 typedef FMOD_RESULT (*SoundReleaseFn)(FMOD_SOUND *);
@@ -330,6 +302,31 @@ static bool g_bridge_enabled = false;
 static int64_t g_bridge_read_pos = 0;
 static uint32_t g_bridge_underruns = 0;
 static unsigned int g_bridge_retry = 0;
+
+/*
+ * Direcciones del juego para control de radio (ETS2 1.62.1.0s).
+ * Estas direcciones pueden cambiar entre versiones del juego.
+ */
+#define GAME_BUS_ARRAY_PTR      0x1430b5850
+#define GAME_FMOD_STUDIO_PTR    0x1430b5948
+#define GAME_FMOD_CORE_PTR      0x1430b5950
+#define GAME_RADIO_BUS_INDEX    26
+
+/* Offsets en fmod_bus_t */
+#define BUS_OFF_VOLUME          0x04
+#define BUS_OFF_MUTE_FLAGS      0x08
+#define BUS_OFF_FMOD_BUS        0x20
+#define BUS_OFF_CHANNELGROUP    0x48
+
+/* Typedef para Bus::setVolume */
+typedef FMOD_RESULT (*BusSetVolumeFn)(void *bus, float volume);
+typedef FMOD_RESULT (*BusSetMuteFn)(void *bus, int mute);
+
+static BusSetVolumeFn g_bus_set_volume = NULL;
+static BusSetMuteFn g_bus_set_mute = NULL;
+static void *g_game_radio_bus = NULL;  /* Puntero al fmod_bus_t del juego */
+static float g_original_radio_volume = 1.0f;
+static bool g_radio_muted_by_us = false;
 #endif
 
 #ifdef __APPLE__
@@ -1015,21 +1012,37 @@ static bool bridge_try_start(FMOD_SYSTEM *core) {
 
     if (g_bridge_sound) return true;  /* ya creado */
 
-    FMOD_CREATESOUNDEXINFO exinfo;
-    memset(&exinfo, 0, sizeof(exinfo));
-    exinfo.cbsize            = sizeof(FMOD_CREATESOUNDEXINFO);
-    exinfo.numchannels       = 2;
-    exinfo.defaultfrequency  = 48000;
-    exinfo.format            = FMOD_SOUND_FORMAT_PCMFLOAT;
-    exinfo.decodebuffersize  = 1024;  /* ~21 ms de buffer interno */
-    exinfo.length            = exinfo.defaultfrequency * exinfo.numchannels *
-                               sizeof(float) * 2;  /* 2 segundos de "longitud virtual" */
-    exinfo.pcmreadcallback   = bridge_pcm_read;
+    /* Construir FMOD_CREATESOUNDEXINFO manualmente con offsets fijos */
+    char exinfo[EXINFO_SIZE];
+    memset(exinfo, 0, EXINFO_SIZE);
 
+    /* cbsize: tamaño del struct */
+    *(int *)(exinfo + EXINFO_OFF_CBSIZE) = EXINFO_SIZE;
+    /* length: tamaño en bytes del audio virtual (2 segundos) */
+    *(unsigned int *)(exinfo + EXINFO_OFF_LENGTH) = 48000 * 2 * sizeof(float) * 2;
+    /* numchannels */
+    *(int *)(exinfo + EXINFO_OFF_NUMCHANNELS) = 2;
+    /* defaultfrequency */
+    *(int *)(exinfo + EXINFO_OFF_DEFAULTFREQ) = 48000;
+    /* format = FMOD_SOUND_FORMAT_PCMFLOAT */
+    *(int *)(exinfo + EXINFO_OFF_FORMAT) = FMOD_SOUND_FORMAT_PCMFLOAT;
+    /* decodebuffersize */
+    *(unsigned int *)(exinfo + EXINFO_OFF_DECODEBUFSIZE) = 1024;
+    /* pcmreadcallback */
+    *(FMOD_SOUND_PCMREAD_CALLBACK *)(exinfo + EXINFO_OFF_PCMREADCB) = bridge_pcm_read;
+
+    cabin_log("Bridge: creating sound with exinfo size=%d, format=%d, channels=%d, freq=%d",
+              EXINFO_SIZE, FMOD_SOUND_FORMAT_PCMFLOAT, 2, 48000);
+    cabin_log("Bridge: offsets - cbsize=%d, length=%d, numch=%d, freq=%d, fmt=%d, decbuf=%d, pcmcb=%d",
+              EXINFO_OFF_CBSIZE, EXINFO_OFF_LENGTH, EXINFO_OFF_NUMCHANNELS,
+              EXINFO_OFF_DEFAULTFREQ, EXINFO_OFF_FORMAT, EXINFO_OFF_DECODEBUFSIZE,
+              EXINFO_OFF_PCMREADCB);
+
+    /* Probar primero con PCM16 que tiene mejor soporte */
     FMOD_RESULT result = g_api.create_sound(
-        core, NULL,
-        FMOD_OPENUSER | FMOD_CREATESTREAM | FMOD_LOOP_NORMAL,
-        &exinfo, &g_bridge_sound);
+        core, "",  /* nombre vacío, no NULL, para OPENUSER */
+        FMOD_OPENUSER | FMOD_CREATESTREAM | FMOD_LOOP_NORMAL | FMOD_2D,
+        exinfo, &g_bridge_sound);
 
     if (result != FMOD_OK || !g_bridge_sound) {
         cabin_log("Bridge: could not create Sound (FMOD result %d).", result);
@@ -1053,6 +1066,10 @@ static bool bridge_try_start(FMOD_SYSTEM *core) {
     return true;
 }
 
+/* Forward declarations para control de radio */
+static bool radio_control_init(void);
+static void radio_mute_game_station(bool mute);
+
 /*
  * Llamada desde cabin_after_update: revisa si hay un productor conectado.
  */
@@ -1067,7 +1084,15 @@ static void bridge_update(FMOD_SYSTEM *core) {
         return;
     }
 
+    /* Inicializar control de radio si no está listo */
+    static bool radio_init_tried = false;
+    if (!radio_init_tried) {
+        radio_init_tried = true;
+        radio_control_init();
+    }
+
     /* Verificar que el productor sigue vivo */
+    bool was_enabled = g_bridge_enabled;
     if (!g_bridge->capturing) {
         /* El productor dejó de capturar; lo consideramos desconectado */
         if (g_bridge_enabled) {
@@ -1080,6 +1105,15 @@ static void bridge_update(FMOD_SYSTEM *core) {
         cabin_log("Bridge: producer resumed.");
     }
 
+    /* Controlar la emisora del juego según estado del audio externo */
+    if (g_bridge_enabled && !was_enabled) {
+        /* Audio externo comenzó: silenciar la emisora del juego */
+        radio_mute_game_station(true);
+    } else if (!g_bridge_enabled && was_enabled) {
+        /* Audio externo paró: restaurar la emisora del juego */
+        radio_mute_game_station(false);
+    }
+
     /* Write-back del estado para el productor */
     if (g_bridge_channel && g_api.channel_is_playing) {
         int playing = 0;
@@ -1087,6 +1121,68 @@ static void bridge_update(FMOD_SYSTEM *core) {
         g_bridge->playing = playing ? 1 : 0;
     }
     g_bridge->underruns = g_bridge_underruns;
+}
+
+/*
+ * Control del bus de radio del juego.
+ * Permite silenciar la emisora cuando hay audio externo.
+ */
+static bool radio_control_init(void) {
+    if (g_game_radio_bus) return true;
+
+    /* Intentar leer el array de buses del juego */
+    uint64_t *bus_array_ptr = (uint64_t *)GAME_BUS_ARRAY_PTR;
+    if (!bus_array_ptr || !*bus_array_ptr) {
+        return false;
+    }
+
+    uint64_t bus_array = *bus_array_ptr;
+    uint64_t *radio_bus_ptr = (uint64_t *)(bus_array + GAME_RADIO_BUS_INDEX * 8);
+    if (!radio_bus_ptr || !*radio_bus_ptr) {
+        return false;
+    }
+
+    g_game_radio_bus = (void *)*radio_bus_ptr;
+
+    /* Leer el volumen actual */
+    float *vol_ptr = (float *)((char *)g_game_radio_bus + BUS_OFF_VOLUME);
+    g_original_radio_volume = *vol_ptr;
+
+    /* Cargar las funciones de FMOD para controlar el bus */
+    g_bus_set_volume = (BusSetVolumeFn)load_symbol("FMOD_Studio_Bus_SetVolume");
+    g_bus_set_mute = (BusSetMuteFn)load_symbol("FMOD_Studio_Bus_SetMute");
+
+    cabin_log("Radio control: initialized (bus=%p, vol=%.2f)",
+              g_game_radio_bus, g_original_radio_volume);
+    return true;
+}
+
+static void radio_set_game_volume(float volume) {
+    if (!g_game_radio_bus || !g_bus_set_volume) return;
+
+    /* Obtener el FMOD::Studio::Bus* */
+    void **fmod_bus_ptr = (void **)((char *)g_game_radio_bus + BUS_OFF_FMOD_BUS);
+    if (!fmod_bus_ptr || !*fmod_bus_ptr) return;
+
+    g_bus_set_volume(*fmod_bus_ptr, volume);
+}
+
+static void radio_mute_game_station(bool mute) {
+    if (!g_game_radio_bus) return;
+
+    if (mute && !g_radio_muted_by_us) {
+        /* Guardar el volumen actual y silenciar */
+        float *vol_ptr = (float *)((char *)g_game_radio_bus + BUS_OFF_VOLUME);
+        g_original_radio_volume = *vol_ptr;
+        radio_set_game_volume(0.0f);
+        g_radio_muted_by_us = true;
+        cabin_log("Radio control: muted game station (was %.2f)", g_original_radio_volume);
+    } else if (!mute && g_radio_muted_by_us) {
+        /* Restaurar el volumen */
+        radio_set_game_volume(g_original_radio_volume);
+        g_radio_muted_by_us = false;
+        cabin_log("Radio control: restored game station volume to %.2f", g_original_radio_volume);
+    }
 }
 
 #endif /* _WIN32 */
