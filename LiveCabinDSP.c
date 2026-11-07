@@ -328,6 +328,8 @@ static void *g_game_radio_bus = NULL;  /* Puntero al fmod_bus_t del juego */
 static float g_original_radio_volume = 1.0f;
 static float g_current_radio_volume = 1.0f;  /* volumen actualmente aplicado */
 static bool g_radio_muted_by_us = false;
+static bool g_radio_was_muted = false;       /* estado original del mute */
+static bool g_radio_forced_on = false;       /* true si forzamos encender la radio */
 #endif
 
 #ifdef __APPLE__
@@ -1125,36 +1127,59 @@ static void bridge_update(FMOD_SYSTEM *core) {
 
     /* Controlar la emisora del juego según parámetros del bridge */
     if (g_bridge_enabled && g_game_radio_bus) {
-        /* Guardar volumen original si es la primera vez */
-        if (!g_radio_muted_by_us) {
+        /* Primera vez: guardar estado original y forzar encender la radio */
+        if (!g_radio_forced_on) {
+            /* Guardar volumen y estado de mute original */
             float *vol_ptr = (float *)((char *)g_game_radio_bus + BUS_OFF_VOLUME);
+            uint32_t *mute_ptr = (uint32_t *)((char *)g_game_radio_bus + BUS_OFF_MUTE_FLAGS);
             g_original_radio_volume = *vol_ptr;
+            g_radio_was_muted = (*mute_ptr != 0);
+            g_radio_forced_on = true;
             g_radio_muted_by_us = true;
-            cabin_log("Radio control: saving original volume %.2f", g_original_radio_volume);
+
+            /* Forzar unmute del bus de radio para que suene nuestro audio */
+            if (g_bus_set_mute) {
+                void **fmod_bus_ptr = (void **)((char *)g_game_radio_bus + BUS_OFF_FMOD_BUS);
+                if (fmod_bus_ptr && *fmod_bus_ptr) {
+                    g_bus_set_mute(*fmod_bus_ptr, 0);  /* unmute */
+                }
+            }
+            cabin_log("Radio control: forced ON (was muted=%d, vol=%.2f)",
+                      g_radio_was_muted, g_original_radio_volume);
         }
 
         /* Calcular volumen objetivo como factor del original */
         float factor = 1.0f;
         if (g_bridge->mute_game_radio) {
-            factor = 0.0f;
+            factor = 0.0f;  /* el usuario quiere silenciar la emisora */
         } else {
-            /* radio_volume es un factor (0.0-1.0) del volumen original */
             factor = g_bridge->radio_volume;
-            if (factor < 0.0f) factor = 1.0f;  /* default: sin cambio */
+            if (factor < 0.0f) factor = 1.0f;
             if (factor > 1.0f) factor = 1.0f;
-            /* duck_factor se aplica adicionalmente */
             if (g_bridge->duck_factor >= 0.0f && g_bridge->duck_factor < 1.0f) {
                 factor *= g_bridge->duck_factor;
             }
         }
+        /* Aplicar un volumen mínimo para que el bus no se desactive */
         float target_vol = g_original_radio_volume * factor;
+        if (target_vol < 0.01f && !g_bridge->mute_game_radio) target_vol = 0.01f;
         radio_set_game_volume(target_vol);
 
-    } else if (was_enabled && g_radio_muted_by_us) {
-        /* Audio externo paró: restaurar la emisora del juego */
+    } else if (was_enabled && g_radio_forced_on) {
+        /* Audio externo paró: restaurar estado original de la radio */
         radio_set_game_volume(g_original_radio_volume);
+
+        /* Restaurar estado de mute si estaba muteado antes */
+        if (g_radio_was_muted && g_bus_set_mute) {
+            void **fmod_bus_ptr = (void **)((char *)g_game_radio_bus + BUS_OFF_FMOD_BUS);
+            if (fmod_bus_ptr && *fmod_bus_ptr) {
+                g_bus_set_mute(*fmod_bus_ptr, 1);  /* mute */
+            }
+        }
+        g_radio_forced_on = false;
         g_radio_muted_by_us = false;
-        cabin_log("Radio control: restored volume to %.2f", g_original_radio_volume);
+        cabin_log("Radio control: restored (mute=%d, vol=%.2f)",
+                  g_radio_was_muted, g_original_radio_volume);
     }
 
     /* Volumen del canal de audio externo */
