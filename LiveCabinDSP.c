@@ -1031,22 +1031,38 @@ static bool bridge_try_start(FMOD_SYSTEM *core) {
     /* pcmreadcallback */
     *(FMOD_SOUND_PCMREAD_CALLBACK *)(exinfo + EXINFO_OFF_PCMREADCB) = bridge_pcm_read;
 
-    cabin_log("Bridge: creating sound with exinfo size=%d, format=%d, channels=%d, freq=%d",
-              EXINFO_SIZE, FMOD_SOUND_FORMAT_PCMFLOAT, 2, 48000);
-    cabin_log("Bridge: offsets - cbsize=%d, length=%d, numch=%d, freq=%d, fmt=%d, decbuf=%d, pcmcb=%d",
-              EXINFO_OFF_CBSIZE, EXINFO_OFF_LENGTH, EXINFO_OFF_NUMCHANNELS,
-              EXINFO_OFF_DEFAULTFREQ, EXINFO_OFF_FORMAT, EXINFO_OFF_DECODEBUFSIZE,
-              EXINFO_OFF_PCMREADCB);
+    cabin_log("Bridge: creating sound - exinfo=%d bytes, core=%p, group=%p",
+              EXINFO_SIZE, (void*)core, (void*)g_radio_group);
 
-    /* Probar primero con PCM16 que tiene mejor soporte */
+    /* Intentar con PCMFLOAT primero */
     FMOD_RESULT result = g_api.create_sound(
-        core, "",  /* nombre vacío, no NULL, para OPENUSER */
+        core, "",  /* nombre vacío para OPENUSER */
         FMOD_OPENUSER | FMOD_CREATESTREAM | FMOD_LOOP_NORMAL | FMOD_2D,
         exinfo, &g_bridge_sound);
 
     if (result != FMOD_OK || !g_bridge_sound) {
-        cabin_log("Bridge: could not create Sound (FMOD result %d).", result);
-        return false;
+        cabin_log("Bridge: PCMFLOAT failed (err %d), trying PCM16...", result);
+
+        /* Fallback a PCM16 que tiene mejor compatibilidad */
+        memset(exinfo, 0, EXINFO_SIZE);
+        *(int *)(exinfo + EXINFO_OFF_CBSIZE) = EXINFO_SIZE;
+        *(unsigned int *)(exinfo + EXINFO_OFF_LENGTH) = 48000 * 2 * 2 * 2; /* 2 bytes per sample */
+        *(int *)(exinfo + EXINFO_OFF_NUMCHANNELS) = 2;
+        *(int *)(exinfo + EXINFO_OFF_DEFAULTFREQ) = 48000;
+        *(int *)(exinfo + EXINFO_OFF_FORMAT) = 2;  /* FMOD_SOUND_FORMAT_PCM16 */
+        *(unsigned int *)(exinfo + EXINFO_OFF_DECODEBUFSIZE) = 1024;
+        *(FMOD_SOUND_PCMREAD_CALLBACK *)(exinfo + EXINFO_OFF_PCMREADCB) = bridge_pcm_read;
+
+        result = g_api.create_sound(
+            core, "",
+            FMOD_OPENUSER | FMOD_CREATESTREAM | FMOD_LOOP_NORMAL | FMOD_2D,
+            exinfo, &g_bridge_sound);
+
+        if (result != FMOD_OK || !g_bridge_sound) {
+            cabin_log("Bridge: PCM16 also failed (err %d). Cannot create stream.", result);
+            return false;
+        }
+        cabin_log("Bridge: PCM16 fallback succeeded.");
     }
 
     result = g_api.play_sound(core, g_bridge_sound, g_radio_group, 0, &g_bridge_channel);
