@@ -22,7 +22,7 @@ if not exist "build\CMakeCache.txt" (
 rem Compilar
 echo.
 echo Compilando...
-cmake --build build --config %CONFIG% --target ETS2CabinDSP bridge_test
+cmake --build build --config %CONFIG% --target ETS2CabinDSP bridge_test capture_process
 if errorlevel 1 (
     echo Error: build fallo
     exit /b 1

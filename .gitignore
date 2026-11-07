@@ -6,3 +6,10 @@ build/
 *.exe
 *.pdb
 *.ilk
+
+# Artefactos locales de prueba del capturador
+/*.wav
+/*.log
+
+# SDK completo copiado del template; no se usa (ver SESSION.md)
+scs_sdk/

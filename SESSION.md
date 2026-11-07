@@ -118,9 +118,23 @@ Log de diagnóstico: `%LOCALAPPDATA%\ETS2 Cabin Radio\live-dsp.log`
 
 ## Pendiente / próximos pasos
 
-- **Captura por proceso (Chrome/YouTube):** ver `TEST_PROCESS_LOOPBACK.md`. Decide la
-  viabilidad de integrar al master de plugins. Pregunta clave: ¿mutear `chrome.exe` deja
-  intacta la captura por *process loopback*? Si no, Plan B con VB-Cable.
+- **Captura por proceso (Chrome/YouTube):** TESTEJADO (2026-11-07). Resultado en
+  `TEST_PROCESS_LOOPBACK.md`:
+  - El tap del process loopback está **después del volumen de sesión** y **antes del mute
+    del endpoint**. `SetMute` / volumen 0 deja la captura en silencio digital.
+  - Solución validada con **una sola salida**: bajar la sesión a ~0.00001 (−100 dB,
+    inaudible en altavoces) y amplificar la captura +100 dB. El mix interno es float32 y
+    conserva la señal. `capture_process.exe --duck` lo hace automático y restaura el
+    volumen original al salir.
+  - Alternativa sin tocar el volumen: dos endpoints (Chrome en uno muteado, ETS2 en otro);
+    el process loopback no está atado a un endpoint.
+  - Implementado `tools/capture_process.exe` (bridge, `--test`, `--duck`, `--boost`,
+    `--float`, `--monitor`) y utilidades `tools/audio_sessions.py` /
+    `tools/mute_process.py`.
+  - Tiempo real: continuo, sin reiniciar al cambiar de canción. Latencia monitor
+    ~35–55 ms; en el juego ~60–120 ms (buffer DSP/FMOD incluido).
+  - VB-Cable descartado por decisión del usuario. Captura de pestaña de Chrome también
+    descartada.
 - **Error cosmético** `UnmapViewOfFile: int too long to convert` al cerrar `play_audio.py`
   (no afecta la reproducción; falta `argtypes` en esa llamada, ya resuelto en `set_volume.py`).
 - **Contadores de debug** (`mix_count`, `dsp_call_count`) y logs periódicos siguen en el

@@ -217,3 +217,100 @@ Obtener el PID de Chrome con la sesión de audio activa (ver test abajo).
   audio se corrompe (bug ya observado con procesos Python duplicados). Matar instancias
   previas antes de lanzar.
 - No tocar `ETS2CabinDSP.dll` ni el DSP; el contrato del bridge es estable.
+
+---
+
+## Resultado del test (2026-11-07)
+
+Implementado y ejecutado `tools/capture_process.exe` en modo autónomo (`--test`, sin
+DLL ni juego) contra Chrome reproduciendo YouTube.
+
+| Escenario | Paquetes/s | frames/s | RMS | Pico | Resultado |
+|-----------|-----------:|---------:|----:|-----:|-----------|
+| Sin mute, volumen 1.0 | ~100 | 48000 | ≈ −16 dBFS | 0.59 | Captura correcta |
+| Mute de **sesión** (`SetMute`) | ~100 | 48000 | −96.7 dBFS | 0.000 | ❌ El mute mata el contenido |
+| **Volumen de sesión** 0.5 | ~100 | 48000 | ≈ −22 dBFS | 0.32 | Escala −6 dB |
+| **Volumen de sesión** 0.1 | ~100 | 48000 | ≈ −36 dBFS | 0.07 | Escala −20 dB |
+| **Volumen de sesión** 0.01 | ~100 | 48000 | ≈ −57 dBFS | 0.005 | Escala −40 dB |
+| **Volumen de sesión** 0.00001 + boost 100 dB | ~100 | 48000 | ≈ −16 dBFS | 0.5 | ✅ Audio recuperado |
+| Mute del **endpoint** de salida | ~100 | 48000 | ≈ −17 dBFS | 0.55 | ✅ La captura sobrevive |
+
+**Conclusión:** el *process loopback* toma el audio **después del volumen de sesión** y
+**antes del mute del endpoint**. Por eso:
+
+- `SetMute` / volumen 0 → silencio digital (no recuperable).
+- Bajar el volumen de sesión a un valor ínfimo pero **no cero** → la captura conserva la
+  señal, atenuada; se puede recuperar con ganancia digital.
+- Mutear el endpoint → la captura no se entera.
+
+### Solución sin drivers, sin VB-Cable, sin tabs y con **una sola salida**
+
+Bajar la sesión de Chrome a `0.00001` (−100 dBFS, inaudible en cualquier altavoz) y
+amplificar la captura +100 dB. El motor de audio de Windows mezcla en float32, así que a
+−100 dB la señal sigue teniendo resolución suficiente. Validado: RMS restaurado a
+≈ −16 dBFS con picos limpios (sin clipping con 1.5 dB de margen).
+
+`capture_process.exe --duck` hace todo automático:
+
+1. Enumera las sesiones de audio del árbol de procesos del PID.
+2. Guarda el volumen/mute originales.
+3. Los baja a `1e-5` (o `--duck-volume V`) y los desmutea.
+4. Captura en float32 y aplica el boost compensatorio.
+5. Al salir (Ctrl+C) **restaura** el volumen y mute originales.
+6. Re-enumera cada 1 s para duckear sesiones nuevas y **re-aplicar** el volumen a las
+   existentes si alguien lo sube a mano.
+7. Protección anti-picos: limitador por paquete (pico de salida ≤ 0.95) y *gate* que
+   silencia el paquete si el pico capturado es mucho mayor de lo esperado. Al detectarlo
+   re-aplica el duck de inmediato: si subes el volumen a mano, se oyen ~60 ms de silencio
+   en vez de un pepinazo.
+
+Uso:
+
+```
+capture_process.exe <PID_chrome> --duck                  (bridge del juego)
+capture_process.exe <PID_chrome> --test out.wav --duck   (prueba sin DLL)
+```
+
+Ventaja: funciona con **un solo dispositivo de salida** y sin instalar nada.
+
+Contrapartida: mientras corre, el volumen de Chrome en el mezclador aparece a ~0%; se
+restaura al cerrar. Si el proceso se mata a la fuerza (sin Ctrl+C), el volumen puede
+quedar bajo y hay que subirlo a mano.
+
+### Tiempo real y latencia
+
+La captura es **continua**, no una grabación: el capturador lee paquetes y escribe al
+anillo mientras el proceso reproduce. Cambiar de canción/vídeo/pestaña dentro de la misma
+app no interrumpe nada; durante una pausa llegan tramas de silencio y al reanudar sigue
+solo. Solo hay que relanzar el capturador si se cambia de **aplicación** (cambia el PID).
+
+Latencia medida con `--monitor` (captura → dispositivo predeterminado):
+
+- Cola del monitor: 0–20 ms.
+- Buffer del dispositivo: 23.4 ms.
+- Buffer de captura WASAPI: ~10 ms.
+- **Total monitor: ~35–55 ms.**
+
+En el juego se suma el buffer del DSP/FMOD: **~60–120 ms** en total. Para música es
+imperceptible; para vídeo es 1–3 fotogramas. No hay “lag” de cortes: en 25 s se
+capturaron 1.200.000 frames exactos (48 000/s), 2.500 paquetes, 0 pérdidas.
+
+### Alternativa (si se prefiere no tocar el volumen de la app)
+
+Usar **dos endpoints de salida**: Chrome → endpoint secundario muteado; ETS2 → endpoint
+principal. El *process loopback* no está atado a un endpoint (README oficial del sample
+`ApplicationLoopback`: *"the capture is not tied to a specific audio endpoint"*), así que
+captura Chrome aunque renderice en el endpoint muteado. Requiere dos dispositivos.
+
+### Herramientas añadidas
+
+- `tools/capture_process.cpp` → `build/Release/capture_process.exe`
+  - `capture_process.exe <PID> [volumen]` → modo bridge (juego + DLL).
+  - `capture_process.exe <PID> --duck` → bridge + ducking automático (recomendado).
+  - `capture_process.exe <PID> --test [salida.wav] [--seconds N]` → modo autónomo,
+    graba WAV y muestra paquetes/s, frames/s, RMS y pico.
+  - `capture_process.exe <PID> --monitor [--seconds N]` → reproduce en tiempo real por
+    el dispositivo predeterminado (implica `--duck`). Sirve para probar continuidad y
+    latencia sin ETS2.
+- `tools/audio_sessions.py` → lista PID/proceso/mute de las sesiones de audio.
+- `tools/mute_process.py <nombre.exe> <1|0>` → mutea/desmutea por proceso.
