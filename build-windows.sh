@@ -33,4 +33,11 @@ fi
   -o "ETS2 Cabin Radio.exe" windows_main.c app.res \
   -lcomctl32 -lcomdlg32 -lshell32 -lshlwapi -lgdi32 -luser32 -ladvapi32
 
-echo "==> Windows build complete: 'ETS2 Cabin Radio.exe' and 'ETS2CabinDSP.dll'"
+# 3. Compile bridge test tool (for testing external audio without the real producer)
+"$ZIG" cc -target x86_64-windows-gnu -O2 -Wall -Wextra \
+  -o bridge_test.exe tools/bridge_test.c
+
+echo "==> Windows build complete:"
+echo "    - ETS2 Cabin Radio.exe (launcher)"
+echo "    - ETS2CabinDSP.dll (live DSP)"
+echo "    - bridge_test.exe (test tone producer)"
